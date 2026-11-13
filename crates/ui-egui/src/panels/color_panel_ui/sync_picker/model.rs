@@ -160,6 +160,29 @@ pub(super) fn lch_to_rgb(lch: Lch) -> [f32; 3] {
     linear_of(l, c * a, c * b).map(|v| encode(v) as f32)
 }
 
+/// The colour `t` of the way from `a` to `b` (sRGB-encoded) along the straight line between them
+/// in OKLab. In OKLCH's cylinder that line is a chord: it cuts across inside the arc that turning
+/// the hue would follow, so the colours between two hues lose chroma on the way, down to a grey
+/// between opposite ones. Where the line leaves sRGB (the gamut is not convex in OKLab) the colour
+/// keeps its lightness and hue and takes the chroma sRGB holds. The ends are `a` and `b` exactly.
+pub(super) fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    let t = f64::from(sane(t, 0.0, 1.0));
+    if t <= 0.0 {
+        return a.map(|v| sane(v, 0.0, 1.0));
+    }
+    if t >= 1.0 {
+        return b.map(|v| sane(v, 0.0, 1.0));
+    }
+    let ([l0, a0, b0], [l1, a1, b1]) = (lab_of(a), lab_of(b));
+    let between = |from: f64, to: f64| from + (to - from) * t;
+    let (l, x, y) = (between(l0, l1), between(a0, a1), between(b0, b1));
+    let c = x.hypot(y);
+    // A grey has no direction; any will do for a chroma of zero.
+    let (toward_a, toward_b) = if c > 0.0 { (x / c, y / c) } else { (1.0, 0.0) };
+    let c = c.min(limit(l, toward_a, toward_b));
+    linear_of(l, c * toward_a, c * toward_b).map(|v| encode(v) as f32)
+}
+
 /// The OKLCH hue strip from its top (hue 1) to its bottom (hue 0): each hue's most chromatic sRGB
 /// colour. The same for every colour, so it is worked out once.
 pub(super) fn hue_strip() -> &'static [[f32; 3]] {

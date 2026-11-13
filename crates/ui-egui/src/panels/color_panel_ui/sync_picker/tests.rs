@@ -2,11 +2,11 @@
 
 use egui::{Modifiers, Pos2, Rect, Vec2, pos2, vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use photocraft_color::convert::{hsb_to_rgb, rgb_to_hsb};
 
-use super::model::{C_MAX, FIELD_MAX_PX, Held, Lch, cusp, field_pixels, hue_strip, lch_to_rgb, max_chroma, rgb_to_lch};
-use super::{Opt, slots};
+use super::model::{C_MAX, FIELD_MAX_PX, Held, Lch, cusp, field_pixels, hue_strip, lch_to_rgb, max_chroma, mix, rgb_to_lch};
+use super::{Ends, Opt, Picked, Rows, bar_of, ends_id, picked_id, slots};
 use crate::PhotocraftApp;
 use crate::dock::Group;
 use crate::state::ColorPanelMode;
@@ -115,6 +115,9 @@ fn hostile_numbers_give_colours() {
             assert!(ok(held.rgb) && ok(held.hsb) && held.chroma().is_finite() && held.lch.h.is_finite(), "{a} {b}: {held:?}");
         }
         assert_eq!(field_pixels(a, 4, 3).1.len(), 12);
+        for b in bad {
+            assert!(ok(mix([a, b, 0.5], [b, a, a], a)) && ok(mix([0.2, 0.4, 0.6], [0.9, 0.1, 0.3], b)), "{a} {b}");
+        }
     }
     assert_eq!(field_pixels(0.3, 0, 0), ([0, 0], Vec::new()));
     let (size, pixels) = field_pixels(0.3, usize::MAX, 1_000_000);
@@ -123,8 +126,11 @@ fn hostile_numbers_give_colours() {
     for area in
         [Rect::from_min_size(Pos2::ZERO, Vec2::ZERO), Rect::from_min_size(Pos2::ZERO, vec2(5.0, 5.0)), Rect::from_min_size(Pos2::ZERO, vec2(30.0, 400.0))]
     {
-        let s = slots(area);
-        assert!(s.hsb.width() >= 1.0 && s.lch.height() >= 1.0, "{area:?}: {s:?}");
+        for rows in [Rows::default(), Rows { sliders: true, gradient: true }] {
+            let s = slots(area, rows);
+            assert!(s.hsb.width() >= 1.0 && s.lch.height() >= 1.0, "{area:?}: {s:?}");
+            assert_eq!((s.sliders.is_some(), s.gradient.is_some()), (rows.sliders, rows.gradient));
+        }
     }
 }
 
@@ -214,6 +220,57 @@ fn the_chroma_asked_for_survives_a_narrow_hue() {
     assert!((rgb_to_lch(cyan.rgb).c - cyan.chroma()).abs() < 1e-3, "the colour has the chroma that fits");
     let back = cyan.with_lch(Lch { h: 0.912, ..cyan.lch });
     assert!(worst(back.rgb, magenta.rgb) < 1e-6);
+}
+
+/// The gradient between two colours is the straight line between them in OKLab: every point of it
+/// lies that far along in lightness, a and b alike, and its ends are the two colours themselves.
+#[test]
+fn the_gradient_is_the_straight_line_through_oklab() {
+    let lab = |rgb: [f32; 3]| {
+        let q = rgb_to_lch(rgb);
+        let angle = q.h * std::f32::consts::TAU;
+        [q.l, q.c * angle.cos(), q.c * angle.sin()]
+    };
+    let (a, b) = ([0.8, 0.3, 0.2], [0.2, 0.4, 0.8]);
+    assert_eq!((mix(a, b, 0.0), mix(a, b, 1.0)), (a, b));
+    assert_eq!((mix(a, b, -3.0), mix(a, b, 7.0)), (a, b), "past its ends it is the end");
+    let (from, to) = (lab(a), lab(b));
+    for k in 1..16 {
+        let t = k as f32 / 16.0;
+        let got = lab(mix(a, b, t));
+        for i in 0..3 {
+            let want = from[i] + (to[i] - from[i]) * t;
+            assert!((got[i] - want).abs() < 2e-3, "at {t}: OKLab {got:?}, wanted {want} in place {i}");
+        }
+    }
+    // A chord, not an arc: between two colours of opposite hues it passes through a grey.
+    let red = rgb_to_lch([1.0, 0.0, 0.0]);
+    let opposite = Lch { l: red.l, c: 0.1, h: (red.h + 0.5).fract() };
+    let grey = mix([1.0, 0.0, 0.0], lch_to_rgb(opposite), red.c / (red.c + opposite.c));
+    assert!(rgb_to_lch(grey).c < 3e-3 && (rgb_to_lch(grey).l - red.l).abs() < 3e-3, "{grey:?}: {:?}", rgb_to_lch(grey));
+    // Black to white is the greys, evenly in lightness.
+    for k in 0..=10 {
+        let q = rgb_to_lch(mix([0.0; 3], [1.0; 3], k as f32 / 10.0));
+        assert!(q.c < 1e-3 && (q.l - k as f32 / 10.0).abs() < 1e-3, "step {k}: {q:?}");
+    }
+    // Between the cube's corners the line may leave sRGB: the colour is still at the line's
+    // lightness and hue, with the chroma sRGB holds there.
+    let corners = [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 1.0]];
+    for a in corners {
+        for b in corners {
+            let (from, to) = (lab(a), lab(b));
+            for k in 1..12 {
+                let t = k as f32 / 12.0;
+                let want = [0, 1, 2].map(|i| from[i] + (to[i] - from[i]) * t);
+                let (got, chroma) = (lab(mix(a, b, t)), want[1].hypot(want[2]));
+                assert!((got[0] - want[0]).abs() < 6e-3, "{a:?} to {b:?} at {t}: lightness {} for {}", got[0], want[0]);
+                assert!(got[1].hypot(got[2]) <= chroma + 6e-3, "{a:?} to {b:?} at {t}: more chroma than the line has");
+                // The same hue, where there is chroma to have one.
+                let cross = got[1] * want[2] - got[2] * want[1];
+                assert!(chroma < 0.02 || cross.abs() < 0.012 * chroma, "{a:?} to {b:?} at {t}: {got:?} is off the hue of {want:?}");
+            }
+        }
+    }
 }
 
 /// The Color tab of `kind` for `app` with the picker on, alone in a panel of `size` whose dock
@@ -316,6 +373,17 @@ fn the_panel_menu_turns_it_and_its_lines_on_and_off() {
     h.get_by_label("✔ OKLCH Lines").click();
     h.run_steps(2);
     assert!(!Opt::Lines.get(&h.ctx) && h.query_by_label("   OKLCH Lines").is_some());
+    // The sliders and the gradient are on with it, each with a row of its own.
+    for (part, label) in [(Opt::Sliders, "OKLCH Sliders"), (Opt::Gradient, "OKLab Gradient")] {
+        assert!(part.get(&h.ctx), "{label} is on");
+        h.get_by_label(&format!("✔ {label}")).click();
+        h.run_steps(2);
+        assert!(!part.get(&h.ctx) && h.query_by_label(&format!("   {label}")).is_some(), "{label} turned off");
+        assert_eq!(Rows::shown(&h.ctx), Rows { sliders: Opt::Sliders.get(&h.ctx), gradient: Opt::Gradient.get(&h.ctx) });
+        h.get_by_label(&format!("   {label}")).click();
+        h.run_steps(2);
+        assert!(part.get(&h.ctx), "{label} turned back on");
+    }
     // Another mode: the row is unchecked, and picking it comes back to the picker.
     h.get_by_label("   Lab Sliders").click();
     h.run_steps(2);
@@ -420,12 +488,16 @@ fn the_background_chip_edits_the_background() {
 }
 
 /// The picker draws in every theme with and without its lines, in a wide low panel (side by side)
-/// and a narrow tall one (one over the other), and each field keeps a usable size.
+/// and a narrow tall one (one over the other), and each field keeps a usable size. (The fields
+/// alone: the sliders and the gradient are in `the_rows_sit_under_the_fields_in_every_theme`.)
 #[test]
 fn it_lays_out_in_every_theme_and_shape() {
     for kind in ThemeKind::ALL {
         for (size, fill, side_by_side) in [(vec2(300.0, 400.0), 150.0, true), (vec2(250.0, 600.0), 520.0, false), (vec2(600.0, 400.0), 300.0, true)] {
             let mut h = tab(kind, size, fill, app_with([0.9, 0.5, 0.1]));
+            Opt::Sliders.set(&h.ctx, false);
+            Opt::Gradient.set(&h.ctx, false);
+            h.run_steps(2);
             let (hsb, lch) = (rect(&h, "HSB Field"), rect(&h, "OKLCH Field"));
             assert_eq!(lch.left() > hsb.right(), side_by_side, "{kind:?} {size:?}: {hsb:?} {lch:?}");
             assert_eq!(lch.top() > hsb.bottom(), !side_by_side, "{kind:?} {size:?}: {hsb:?} {lch:?}");
@@ -442,7 +514,9 @@ fn it_lays_out_in_every_theme_and_shape() {
     }
 }
 
-/// The picker fits the Color group at its default height in the dock, in every theme.
+/// The fields alone fit the Color group at its default height in the dock, in every theme. With
+/// the sliders and the gradient too the group is too low: the fields keep their least height and
+/// the panel scrolls.
 #[test]
 fn it_fits_the_default_color_group() {
     for kind in ThemeKind::ALL {
@@ -461,6 +535,11 @@ fn it_fits_the_default_color_group() {
         PhotocraftApp::setup_context(&h.ctx, kind);
         Opt::Enabled.set(&h.ctx, true);
         h.run_steps(4);
+        let crowded = rect(&h, "HSB Field");
+        assert!((crowded.height() - super::FIELD_MIN_H).abs() < 0.01 && h.query_by_label("OKLCH L").is_some(), "{kind:?}: {crowded:?}");
+        Opt::Sliders.set(&h.ctx, false);
+        Opt::Gradient.set(&h.ctx, false);
+        h.run_steps(4);
         let group = crate::panel_docking::probe::native_group_rect(h.state(), &h.ctx, Group::Color).unwrap();
         let (hsb, lch, strip) = (rect(&h, "HSB Field"), rect(&h, "OKLCH Field"), rect(&h, "OKLCH Hue"));
         assert!(lch.left() > hsb.right(), "{kind:?}: side by side in the default dock");
@@ -471,8 +550,169 @@ fn it_fits_the_default_color_group() {
     }
 }
 
-/// Offscreen renders to look at: the dock with the picker at its default size and enlarged, and
-/// the Color tab alone in both layouts, with and without the lines.
+/// With the sliders and the gradient on, they sit under the fields in that order, over the foot,
+/// inside what the dock group offers, and the fields keep a usable size, in every theme.
+#[test]
+fn the_rows_sit_under_the_fields_in_every_theme() {
+    for kind in ThemeKind::ALL {
+        for (size, fill) in [(vec2(300.0, 420.0), 330.0_f32), (vec2(250.0, 700.0), 620.0), (vec2(600.0, 420.0), 330.0)] {
+            let h = tab(kind, size, fill, app_with([0.9, 0.5, 0.1]));
+            let (hsb, lch) = (rect(&h, "HSB Field"), rect(&h, "OKLCH Field"));
+            assert!(hsb.width().min(hsb.height()) >= 80.0, "{kind:?} {size:?}: a field of {:?}", hsb.size());
+            let mut above = hsb.bottom().max(lch.bottom());
+            for label in ["OKLCH L", "OKLCH C", "OKLCH H", "OKLab Gradient"] {
+                let row = rect(&h, label);
+                assert!(row.top() >= above && row.height() > 15.0 && row.width() > 100.0, "{kind:?} {size:?}: {label} at {row:?}, under {above}");
+                assert!(row.right() <= size.x, "{kind:?} {size:?}: {label} at {row:?}");
+                above = row.bottom();
+            }
+            for (label, track) in [("OKLCH L value", "OKLCH L"), ("OKLCH C value", "OKLCH C"), ("OKLCH H value", "OKLCH H")] {
+                let (field, track) = (rect(&h, label), rect(&h, track));
+                assert!(field.left() >= track.right() && field.right() <= size.x, "{kind:?} {size:?}: {label} at {field:?} beside {track:?}");
+                assert!(field.center().y > track.top() && field.center().y < track.bottom(), "{kind:?} {size:?}: {label} at {field:?} beside {track:?}");
+            }
+            let (start, end, gradient) = (rect(&h, "Gradient Start"), rect(&h, "Gradient End"), rect(&h, "OKLab Gradient"));
+            assert!(
+                start.right() <= gradient.left() && gradient.right() <= end.left() && end.right() <= size.x,
+                "{kind:?} {size:?}: {start:?} {gradient:?} {end:?}"
+            );
+            assert!(above + 6.0 + 38.0 <= fill + 12.0, "{kind:?} {size:?}: the foot runs past the {fill} pt offered (rows end at {above})");
+        }
+    }
+}
+
+/// The point `x` of the way along the bar of the track named `label`.
+fn on_track(h: &Harness<'_, PhotocraftApp>, label: &str, x: f32) -> Pos2 {
+    let track = rect(h, label);
+    let bar = bar_of(track);
+    pos2(bar.left() + x * bar.width(), track.center().y)
+}
+
+/// A press on a slider's track sets that channel and leaves the other two; past the gamut's edge
+/// the chroma slider gives the edge.
+#[test]
+fn the_sliders_set_their_own_channel() {
+    let mut h = tab(ThemeKind::ProMedium, vec2(300.0, 460.0), 420.0, app_with([0.2, 0.6, 0.8]));
+    let before = held(&h, false);
+    let p = on_track(&h, "OKLCH L", 0.4);
+    press(&mut h, p);
+    let now = held(&h, false);
+    assert!((now.lch.l - 0.4).abs() < 2e-3 && now.lch.c == before.lch.c && now.lch.h == before.lch.h, "{now:?}");
+    let fg = rgb(h.state().session.tools.foreground);
+    assert!(worst(fg, lch_to_rgb(now.lch)) < 1e-6 && (rgb_to_lch(fg).l - 0.4).abs() < 3e-3, "{fg:?}");
+
+    let p = on_track(&h, "OKLCH H", 0.75);
+    press(&mut h, p);
+    let turned = held(&h, false);
+    assert!((turned.lch.h - 0.75).abs() < 2e-3 && turned.lch.l == now.lch.l && turned.lch.c == now.lch.c, "{turned:?}");
+    assert!((rgb_to_lch(rgb(h.state().session.tools.foreground)).h - 0.75).abs() < 3e-3);
+
+    // A quarter of the way along the chroma track is a quarter of the field's width of chroma.
+    let p = on_track(&h, "OKLCH C", 0.25);
+    press(&mut h, p);
+    let muted = held(&h, false);
+    assert!(max_chroma(muted.lch.l, muted.lch.h) > 0.25 * C_MAX, "the press is inside the gamut");
+    assert!((muted.lch.c - 0.25 * C_MAX).abs() < 2e-3 && muted.lch.l == turned.lch.l && muted.lch.h == turned.lch.h, "{muted:?}");
+    assert!((rgb_to_lch(rgb(h.state().session.tools.foreground)).c - 0.25 * C_MAX).abs() < 3e-3);
+    let p = on_track(&h, "OKLCH C", 1.0);
+    press(&mut h, p);
+    let most = held(&h, false);
+    let edge = max_chroma(most.lch.l, most.lch.h);
+    assert!(edge < 0.95 * C_MAX && (most.lch.c - edge).abs() < 1e-6 && (most.chroma() - edge).abs() < 1e-6, "{most:?}, edge {edge}");
+
+    // A drag that leaves the track keeps to its ends.
+    let (from, to) = (on_track(&h, "OKLCH L", 0.5), on_track(&h, "OKLCH L", 4.0) + vec2(0.0, 90.0));
+    h.hover_at(from);
+    h.run_steps(1);
+    button(&mut h, from, true);
+    h.hover_at(to);
+    h.run_steps(2);
+    button(&mut h, to, false);
+    assert_eq!(held(&h, false).lch.l, 1.0);
+    assert!(worst(rgb(h.state().session.tools.foreground), [1.0; 3]) < 1e-3, "full lightness is white");
+}
+
+/// Type `text` into the value field named `label`, replacing what it shows, and leave the field.
+fn type_into(h: &mut Harness<'_, PhotocraftApp>, label: &str, text: &str) {
+    h.get_by_label(label).click();
+    h.run_steps(1);
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::A);
+    h.run_steps(1);
+    for ch in text.chars() {
+        h.event(egui::Event::Text(ch.to_string()));
+        h.run_steps(1);
+    }
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+}
+
+/// A number typed into a slider's field sets that channel; one off its track, or no number at
+/// all, changes nothing and the field goes back to the colour's value.
+#[test]
+fn values_typed_into_the_sliders_fields_set_their_channel() {
+    let mut h = tab(ThemeKind::ProMedium, vec2(300.0, 460.0), 420.0, app_with([0.2, 0.6, 0.8]));
+    type_into(&mut h, "OKLCH L value", "0.42");
+    type_into(&mut h, "OKLCH H value", "200");
+    type_into(&mut h, "OKLCH C value", "0.05");
+    let now = held(&h, false);
+    assert_eq!((now.lch.l, now.lch.c, now.lch.h), (0.42, 0.05, 200.0 / 360.0));
+    let q = rgb_to_lch(rgb(h.state().session.tools.foreground));
+    assert!((q.l - 0.42).abs() < 3e-3 && (q.c - 0.05).abs() < 3e-3 && (q.h * 360.0 - 200.0).abs() < 1.0, "{q:?}");
+    for (label, bad) in [("OKLCH L value", "7"), ("OKLCH C value", "-0.1"), ("OKLCH H value", "361"), ("OKLCH L value", "light"), ("OKLCH H value", "")] {
+        type_into(&mut h, label, bad);
+        assert_eq!(held(&h, false), now, "{label}: {bad:?} changes nothing");
+    }
+    // More chroma than the gamut holds there is the gamut's edge, and the field shows it.
+    type_into(&mut h, "OKLCH C value", "0.3");
+    let most = held(&h, false);
+    let edge = max_chroma(0.42, 200.0 / 360.0);
+    assert!(edge < 0.2 && (most.lch.c - edge).abs() < 1e-6, "{most:?}, edge {edge}");
+    let shown = h.get_by_label("OKLCH C value").accesskit_node().value().map(|v| v.to_string()).unwrap_or_default();
+    assert_eq!(shown, format!("{edge:.3}"));
+}
+
+/// The gradient starts between the foreground and the background; a click on an end's chip puts
+/// the current colour there, and a press along it picks the colour of the straight line through
+/// OKLab between the two, its ends being the two colours themselves.
+#[test]
+fn the_gradient_takes_its_ends_from_the_colour_and_picks_between_them() {
+    let mut h = tab(ThemeKind::ProMedium, vec2(300.0, 460.0), 420.0, app_with([0.9, 0.5, 0.1]));
+    let ends = |h: &Harness<'_, PhotocraftApp>| h.ctx.data_mut(|d| d.get_persisted::<Ends>(ends_id())).expect("the gradient has drawn");
+    let picked = |h: &Harness<'_, PhotocraftApp>| h.ctx.data(|d| d.get_temp::<Picked>(picked_id()));
+    let orange = [0.9, 0.5, 0.1];
+    assert_eq!(ends(&h), [orange, [1.0; 3]], "the foreground and the background");
+    assert!(picked(&h).is_none());
+
+    let p = on_track(&h, "OKLab Gradient", 0.5);
+    press(&mut h, p);
+    let fg = rgb(h.state().session.tools.foreground);
+    assert!(worst(fg, mix(orange, [1.0; 3], 0.5)) < 2e-3 && worst(fg, orange) > 0.05, "{fg:?}");
+    assert_eq!(held(&h, false).lch, rgb_to_lch(fg), "the fields follow the pick");
+    assert!(picked(&h).is_some_and(|(x, colour)| (x - 0.5).abs() < 1e-3 && colour == fg), "{:?}", picked(&h));
+    assert_eq!(ends(&h), [orange, [1.0; 3]], "a pick leaves the ends alone");
+
+    // The colour just picked goes to the end; then a blue to the start.
+    h.get_by_label("Gradient End").click();
+    h.run_steps(2);
+    assert_eq!(ends(&h), [orange, fg]);
+    assert!(picked(&h).is_none(), "another gradient: the thumb goes");
+    let blue = [0.1, 0.2, 0.9];
+    h.state_mut().session.tools.foreground = [0.1, 0.2, 0.9, 1.0];
+    h.run_steps(2);
+    h.get_by_label("Gradient Start").click();
+    h.run_steps(2);
+    assert_eq!(ends(&h), [blue, fg]);
+    for (x, want) in [(0.0, blue), (1.0, fg), (0.25, mix(blue, fg, 0.25))] {
+        let p = on_track(&h, "OKLab Gradient", x);
+        press(&mut h, p);
+        let got = rgb(h.state().session.tools.foreground);
+        assert!(worst(got, want) < if x == 0.25 { 2e-3 } else { 1e-6 }, "at {x}: {got:?}, wanted {want:?}");
+    }
+    assert_eq!(rgb(h.state().session.tools.background), [1.0; 3], "the background is left alone");
+}
+
+/// Offscreen renders to look at: the dock with the picker in the Color group at its default
+/// height, and the picker alone in both layouts, with and without the lines.
 #[test]
 #[ignore = "offscreen visual inspection; writes PNGs to PHOTOCRAFT_SYNC_PICKER_IMAGES or the temp directory"]
 fn render_for_visual_inspection() {
@@ -482,7 +722,7 @@ fn render_for_visual_inspection() {
     let colours = [("orange", [0.9, 0.5, 0.1]), ("blue", [0.15, 0.25, 0.9]), ("grey", [0.5, 0.5, 0.5])];
     for kind in [ThemeKind::ProMedium, ThemeKind::ProLight] {
         for (name, colour) in colours {
-            for (shape, size, fill) in [("wide", vec2(330.0, 190.0), 170.0_f32), ("tall", vec2(280.0, 560.0), 540.0), ("large", vec2(620.0, 330.0), 310.0)] {
+            for (shape, size, fill) in [("wide", vec2(330.0, 330.0), 310.0_f32), ("tall", vec2(280.0, 700.0), 680.0), ("large", vec2(620.0, 470.0), 450.0)] {
                 for lines in [true, false] {
                     let mut h = Harness::builder().with_size(size).with_pixels_per_point(2.0).with_step_dt(1.0 / 60.0).build_ui_state(
                         move |ui, app: &mut PhotocraftApp| {
@@ -495,6 +735,11 @@ fn render_for_visual_inspection() {
                     );
                     PhotocraftApp::setup_context(&h.ctx, kind);
                     Opt::Lines.set(&h.ctx, lines);
+                    // A gradient with some way to go: a red to a blue, with and without its thumb.
+                    h.ctx.data_mut(|d| d.insert_persisted::<Ends>(ends_id(), [[0.85, 0.2, 0.15], [0.1, 0.3, 0.9]]));
+                    if lines {
+                        h.ctx.data_mut(|d| d.insert_temp::<Picked>(picked_id(), (0.35, colour)));
+                    }
                     h.run_steps(4);
                     let lines = if lines { "lines" } else { "plain" };
                     h.render().unwrap().save(out.join(format!("{kind:?}-{shape}-{name}-{lines}.png"))).unwrap();

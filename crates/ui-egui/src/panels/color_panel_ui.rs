@@ -21,6 +21,8 @@ use crate::widgets;
 use photocraft_color::convert;
 use photocraft_color::convert::{hsb_to_rgb, rgb_to_hsb};
 
+mod sync_picker;
+
 /// Width of the chips column, as the cube field's.
 const CHIPS_W: f32 = 38.0;
 /// Height of one slider row.
@@ -35,6 +37,7 @@ const BOXES_W: f32 = 16.0;
 /// The Color tab: whatever the panel menu picked.
 pub(crate) fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     match app.ui.color_panel.mode {
+        ColorPanelMode::HueCube if sync_picker::enabled(ui.ctx()) => sync_picker::panel(app, ui),
         ColorPanelMode::HueCube | ColorPanelMode::BrightnessCube => crate::panels::color_field(app, ui),
         ColorPanelMode::ColorWheel => wheel(app, ui),
         mode => sliders(app, ui, mode),
@@ -811,6 +814,7 @@ pub(crate) fn panel_menu(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             ui.close();
         }
     }
+    sync_picker::menu_items(app, ui);
     ui.separator();
     let rgb = active(app);
     if ui.button(tl!("Copy Color as HTML")).clicked() {
